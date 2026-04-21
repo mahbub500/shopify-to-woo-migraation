@@ -1,10 +1,11 @@
 import json
+import re
 from woocommerce import API
 
 wordpress_url    = "https://work011.sunnahsoul.com"
 consumer__key    = "ck_de0e6a7dabbce34ec5fc9177d8fa8b1d185660ae"
 consumer__secret = "cs_4c9d9992629ab022802fca79dae97b30dbfa309c"
-json_file        = 'products.json'
+json_file        = "products.json"
 
 wcapi = API(
     url=wordpress_url,
@@ -14,22 +15,23 @@ wcapi = API(
     timeout=60
 )
 
-with open(json_file, 'r', encoding='utf-8') as f:
+with open(json_file, "r", encoding="utf-8") as f:
     shopify_data = json.load(f)
+
+SKIP_PRODUCT_TYPES = {"PV-Module", "Wechselrichter"}
 
 # ──────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────
 
 def clean_url(url):
-    return url.split('?')[0] if url else ""
+    return url.split("?")[0] if url else ""
 
 def make_sku(variant, product_id, index):
     """Return a clean SKU — never None or empty."""
     raw = variant.get("sku")
     if raw and str(raw).strip().lower() not in ("", "none"):
         return str(raw).strip()
-    # fallback: shopify product_id + variant_id
     return f"SHP-{product_id}-{variant.get('id', index)}"
 
 def is_default_only(product_data):
@@ -43,6 +45,14 @@ def is_default_only(product_data):
         and v.get("option2") is None
         and v.get("option3") is None
     )
+
+def sanitize_html(html):
+    """Remove <script> tags and common Shopify tracking pixels from body_html."""
+    if not html:
+        return ""
+    html = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<iframe[\s\S]*?</iframe>", "", html, flags=re.IGNORECASE)
+    return html.strip()
 
 def release_sku_conflict(sku, owner_id):
     """
@@ -67,6 +77,39 @@ def release_sku_conflict(sku, owner_id):
             print(f"    ⚠ Cleared SKU '{sku}' from simple product {prod['id']}")
 
 # ──────────────────────────────────────────────
+# CATEGORY HELPER
+# ──────────────────────────────────────────────
+
+_category_cache = {}
+
+def get_or_create_category(name):
+    """Return WooCommerce category ID for the given name, creating it if needed."""
+    if not name:
+        return None
+
+    name = name.strip()
+    if name in _category_cache:
+        return _category_cache[name]
+
+    r = wcapi.get("products/categories", params={"search": name, "per_page": 10})
+    if r.status_code == 200:
+        for cat in r.json():
+            if cat["name"].lower() == name.lower():
+                _category_cache[name] = cat["id"]
+                print(f"    📂 Found existing category: '{name}' (ID: {cat['id']})")
+                return cat["id"]
+
+    r = wcapi.post("products/categories", {"name": name})
+    if r.status_code in [200, 201]:
+        cat_id = r.json()["id"]
+        _category_cache[name] = cat_id
+        print(f"    📂 Created new category: '{name}' (ID: {cat_id})")
+        return cat_id
+
+    print(f"    ⚠ Failed to create category '{name}': {r.json()}")
+    return None
+
+# ──────────────────────────────────────────────
 # ATTRIBUTE / VARIATION BUILDERS
 # ──────────────────────────────────────────────
 
@@ -76,21 +119,25 @@ def build_attributes(product_data):
         values = [v for v in opt.get("values", []) if v.lower() != "default title"]
         if values:
             attrs.append({
-                "name": opt["name"],
-                "visible": True,
+                "name":      opt["name"],
+                "visible":   True,
                 "variation": True,
-                "options": values
+                "options":   values
             })
     return attrs
 
 def build_variations(product_data, parent_weight_kg, parent_image_url, parent_id):
+    """
+    Build variation payloads. SKU conflicts are resolved AFTER the parent
+    product is saved (parent_id is now valid).
+    """
     variations = []
     for i, variant in enumerate(product_data["variants"]):
-        # skip the dummy "Default Title" variant for variable products
         if variant.get("option1", "").lower() == "default title":
             continue
 
         sku = make_sku(variant, product_data["id"], i)
+        # Resolve conflict now that we have a valid parent_id
         release_sku_conflict(sku, parent_id)
 
         var_weight = variant.get("grams", 0)
@@ -122,16 +169,54 @@ def build_variations(product_data, parent_weight_kg, parent_image_url, parent_id
         variations.append(variation)
     return variations
 
+def delete_existing_variations(pid):
+    """Delete all existing variations on a product before re-adding them (prevents duplicates on update)."""
+    vresp = wcapi.get(f"products/{pid}/variations", params={"per_page": 100})
+    if vresp.status_code != 200 or not vresp.json():
+        return
+    ids = [v["id"] for v in vresp.json()]
+    if not ids:
+        return
+    # Batch delete
+    batch_payload = {"delete": ids}
+    dr = wcapi.post(f"products/{pid}/variations/batch", batch_payload)
+    if dr.status_code in [200, 201]:
+        print(f"    🗑 Deleted {len(ids)} old variation(s) before re-import")
+    else:
+        print(f"    ⚠ Could not delete old variations: {dr.json().get('message', dr.status_code)}")
+
+def push_variations_batch(pid, variations):
+    """Use WooCommerce batch endpoint to create all variations in one request."""
+    if not variations:
+        print("    ℹ No real variations to add (all were Default Title)")
+        return
+
+    batch_payload = {"create": variations}
+    br = wcapi.post(f"products/{pid}/variations/batch", batch_payload)
+
+    if br.status_code not in [200, 201]:
+        print(f"    ❌ Batch variation push failed: {br.json().get('message', br.status_code)}")
+        return
+
+    results = br.json().get("create", [])
+    for res in results:
+        if res.get("error"):
+            print(f"    ❌ Variation error — {res['error'].get('message', res['error'])}")
+        else:
+            print(f"    ✅ Variation added — SKU: {res.get('sku', '?')} (ID: {res.get('id')})")
+
 # ──────────────────────────────────────────────
 # FIND EXISTING PRODUCT
 # ──────────────────────────────────────────────
 
 def find_existing(slug, sku=None):
     """Return existing WooCommerce product dict or None."""
+    # For simple products, try SKU first (more reliable)
     if sku:
         r = wcapi.get("products", params={"sku": sku, "per_page": 5})
         if r.status_code == 200 and r.json():
             return r.json()[0]
+    # Fall back to slug for both simple and variable
     r = wcapi.get("products", params={"slug": slug, "per_page": 5})
     if r.status_code == 200 and r.json():
         return r.json()[0]
@@ -158,28 +243,37 @@ def import_product(data):
     slug = data.get("handle") or title.lower().replace(" ", "-")
     sku  = make_sku(first_variant, data["id"], 0) if simple else ""
 
-    # ── Build tags ──
-    tags = [{"name": t} for t in data.get("tags", [])]
+    tags       = [{"name": t} for t in data.get("tags", [])]
+    categories = []
+    product_type = data.get("product_type", "").strip()
+    if product_type:
+        cat_id = get_or_create_category(product_type)
+        if cat_id:
+            categories.append({"id": cat_id})
 
-    # ── Build product payload ──
     product_payload = {
         "name":              title,
         "type":              "simple" if simple else "variable",
         "status":            "publish",
-        "description":       data.get("body_html", ""),
+        "description":       sanitize_html(data.get("body_html", "")),
         "short_description": "",
         "slug":              slug,
         "images":            [{"src": clean_url(img["src"])} for img in images],
         "weight":            str(parent_weight),
         "tags":              tags,
+        "categories":        categories,
         "meta_data":         [{"key": "_vendor", "value": data.get("vendor", "")}],
     }
 
     if simple:
-        product_payload["sku"]            = sku
-        product_payload["regular_price"]  = str(first_variant["price"])
-        product_payload["manage_stock"]   = False
-        product_payload["stock_status"]   = "instock" if first_variant.get("available", True) else "outofstock"
+        product_payload["sku"]           = sku
+        product_payload["regular_price"] = str(first_variant["price"])
+        product_payload["manage_stock"]  = False
+        product_payload["stock_status"]  = "instock" if first_variant.get("available", True) else "outofstock"
+        # Resolve SKU conflicts for simple products before saving
+        existing_check = find_existing(slug, sku)
+        if not existing_check:
+            release_sku_conflict(sku, -1)  # -1 = product doesn't exist yet
     else:
         product_payload["attributes"] = build_attributes(data)
 
@@ -190,9 +284,11 @@ def import_product(data):
         pid    = existing["id"]
         resp   = wcapi.put(f"products/{pid}", product_payload)
         action = "Updated"
+        is_update = True
     else:
         resp   = wcapi.post("products", product_payload)
         action = "Created"
+        is_update = False
 
     if resp.status_code not in [200, 201]:
         print(f"  ❌ Failed to {action.lower()} '{title}': {resp.json()}")
@@ -201,18 +297,14 @@ def import_product(data):
     pid = resp.json()["id"]
     print(f"  ✅ {action}: '{title}' (ID: {pid})")
 
-    # ── Add variations for variable products ──
+    # ── Handle variations for variable products ──
     if not simple:
+        # On update: clear old variations first to prevent duplicates
+        if is_update:
+            delete_existing_variations(pid)
+
         variations = build_variations(data, parent_weight, parent_image, pid)
-        if not variations:
-            print(f"    ℹ No real variations to add (all were Default Title)")
-            return
-        for var in variations:
-            vr = wcapi.post(f"products/{pid}/variations", var)
-            if vr.status_code in [200, 201]:
-                print(f"    ✅ Variation added — SKU: {var['sku']}")
-            else:
-                print(f"    ❌ Variation failed — SKU: {var['sku']} | {vr.json().get('message', vr.json())}")
+        push_variations_batch(pid, variations)
 
 # ──────────────────────────────────────────────
 # RUN
@@ -222,23 +314,34 @@ print("=" * 60)
 print("Starting Shopify → WooCommerce import (price > 2000)")
 print("=" * 60)
 
-skipped = 0
+skipped  = 0
 imported = 0
 
 for product_data in shopify_data["products"]:
+    title        = product_data.get("title", "Unknown")
+    product_type = product_data.get("product_type", "")
+
+    # ── Skip by product type ──
+    if product_type in SKIP_PRODUCT_TYPES:
+        print(f"  ⏭ Skipped '{title}' — product type: '{product_type}'")
+        skipped += 1
+        continue
+
+    # ── Skip by price ──
     try:
         price = float(product_data["variants"][0]["price"])
     except (KeyError, ValueError, IndexError):
+        print(f"  ⚠ Skipped '{title}' — could not read price")
         skipped += 1
         continue
 
     if price > 2000:
-        print(f"\n→ Processing: {product_data['title']}")
+        print(f"\n→ Processing: {title}")
         import_product(product_data)
         imported += 1
     else:
         skipped += 1
 
 print("\n" + "=" * 60)
-print(f"Done. Imported: {imported} | Skipped (price ≤ 2000 or invalid): {skipped}")
+print(f"Done. Imported: {imported} | Skipped: {skipped}")
 print("=" * 60)

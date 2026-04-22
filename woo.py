@@ -2,9 +2,9 @@ import json
 import re
 from woocommerce import API
 
-wordpress_url    = "https://work011.sunnahsoul.com"
-consumer__key    = "ck_de0e6a7dabbce34ec5fc9177d8fa8b1d185660ae"
-consumer__secret = "cs_4c9d9992629ab022802fca79dae97b30dbfa309c"
+wordpress_url    = "https://xyz.com"
+consumer__key    = ""woo commerce api consumer__key key
+consumer__secret = ""woo commerce api consumer__secret key
 json_file        = "products.json"
 
 wcapi = API(
